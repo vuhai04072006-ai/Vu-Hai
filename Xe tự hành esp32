@@ -1,0 +1,397 @@
+/*
+  PYWORLD.VN - Xe robot tự tránh vật cản
+  ESP32 + HC-SR04 + Servo + L298N
+  (Web AJAX - Đa Nhiệm 2 Nhân - Log 50 Dòng - Số thực 2 chữ số thập phân)
+*/
+
+#include <WiFi.h>
+
+#define TRIG_PIN 18
+#define ECHO_PIN 19
+#define SERVO_PIN 23
+
+#define ENA 27
+#define IN1 26
+#define IN2 25
+
+#define ENB 13
+#define IN3 33
+#define IN4 32
+
+const int KHOANG_DUNG = 30;
+
+const int TOC_DO = 40;
+const int TOC_DO_QUAY = 75;
+
+const int GOC_THANG = 90;
+const int GOC_PHAI = 20;
+const int GOC_TRAI = 160;
+
+const int THOI_GIAN_RE = 550;
+const int THOI_GIAN_QUAY_DAU = 900;
+
+WiFiServer server(80);
+TaskHandle_t WebServerTask;
+
+// Biến trạng thái toàn cục
+String trangThaiHienTai = "Đang khởi động...";
+String hanhDongTiepTheo = "ĐANG CHUẨN BỊ";
+String cssTrangThai = "bg-tien";
+String activeBtn = "TIEN";
+
+float khoangCachTruoc = 0.00;
+float khoangCachPhai = 0.00;
+float khoangCachTrai = 0.00;
+
+struct LogItem {
+  float truoc;
+  float trai;
+  float phai;
+  String huongDi;
+};
+
+// Lưu 50 dòng lịch sử xử lý
+const int MAX_LOG = 50; 
+LogItem historyList[MAX_LOG];
+int logCount = 0;
+
+void ghiLichSu(float t, float l, float r, String h) {
+  for (int i = MAX_LOG - 1; i > 0; i--) {
+    historyList[i] = historyList[i - 1];
+  }
+  historyList[0] = {t, l, r, h};
+  if (logCount < MAX_LOG) logCount++;
+}
+
+void capNhatTrangThai(String tt, String hanhDong, String css, String btn) {
+  trangThaiHienTai = tt;
+  hanhDongTiepTheo = hanhDong;
+  cssTrangThai = css;
+  activeBtn = btn;
+}
+
+// ================= ĐIỀU KHIỂN ĐỘNG CƠ & SERVO =================
+
+void banh(int chanEN, int chanA, int chanB, int v) {
+  v = constrain(v, -100, 100);
+  digitalWrite(chanA, v > 0 ? HIGH : LOW);
+  digitalWrite(chanB, v < 0 ? HIGH : LOW);
+  ledcWrite(chanEN, (uint32_t)abs(v) * 1023 / 100);
+}
+
+void chay(int trai, int phai) {
+  banh(ENA, IN1, IN2, trai);
+  banh(ENB, IN3, IN4, phai);
+}
+
+void rePhai(int thoiGian) {
+  chay(0, 0); delay(100);
+  chay(TOC_DO_QUAY, -TOC_DO_QUAY); delay(thoiGian);
+  chay(0, 0); delay(150);
+}
+
+void reTrai(int thoiGian) {
+  chay(0, 0); delay(100);
+  chay(-TOC_DO_QUAY, TOC_DO_QUAY); delay(thoiGian);
+  chay(0, 0); delay(150);
+}
+
+void datGoc(int goc) {
+  uint32_t us = 500 + 1900UL * constrain(goc, 0, 180) / 180;
+  ledcWrite(SERVO_PIN, (uint32_t)((uint64_t)us * 65536 / 20000));
+}
+
+float doMotLan() {
+  digitalWrite(TRIG_PIN, LOW); delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  unsigned long t = pulseIn(ECHO_PIN, HIGH, 30000);
+  return (t == 0) ? 400.00 : t / 58.0;
+}
+
+float doKhoangCach() {
+  float a = doMotLan(); delay(15);
+  float b = doMotLan(); delay(15);
+  float c = doMotLan();
+  return max(min(a, b), min(max(a, b), c));
+}
+
+float nhin(int goc) {
+  datGoc(goc);
+  delay(300);
+  return doKhoangCach();
+}
+
+// ================= KHỞI ĐỘNG =================
+
+void setup() {
+  Serial.begin(115200);
+
+  WiFi.softAP("ESP32_Robot_Car", "12345678"); 
+  server.begin();
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  int chan[] = {IN1, IN2, IN3, IN4};
+  for (int p : chan) { pinMode(p, OUTPUT); }
+
+  ledcAttach(ENA, 1000, 10);
+  ledcAttach(ENB, 1000, 10);
+  ledcAttach(SERVO_PIN, 50, 16);
+
+  datGoc(GOC_THANG);
+  chay(0, 0);
+  
+  xTaskCreatePinnedToCore(
+    XuLyWebServer, 
+    "WebServer",   
+    10000,         
+    NULL,          
+    1,             
+    &WebServerTask,
+    0              
+  );
+
+  delay(2000);
+}
+
+// ================= TÁC VỤ XỬ LÝ WEB =================
+void XuLyWebServer(void * parameter) {
+  for (;;) { 
+    WiFiClient client = server.available();
+    if (client) {
+      String currentLine = "";
+      String requestString = "";
+      while (client.connected()) {
+        if (client.available()) {
+          char c = client.read();
+          requestString += c;
+          if (c == '\n') {
+            if (currentLine.length() == 0) {
+              
+              if (requestString.indexOf("GET /data") >= 0) {
+                client.println("HTTP/1.1 200 OK");
+                client.println("Content-type:application/json; charset=utf-8");
+                client.println("Connection: close");
+                client.println();
+                
+                String json = "{";
+                // Lấy 2 chữ số thập phân thay vì ép sang kiểu int
+                json += "\"truoc\":" + String(khoangCachTruoc, 2) + ",";
+                json += "\"trai\":" + String(khoangCachTrai, 2) + ",";
+                json += "\"phai\":" + String(khoangCachPhai, 2) + ",";
+                json += "\"tt\":\"" + trangThaiHienTai + "\",";
+                json += "\"hd\":\"" + hanhDongTiepTheo + "\",";
+                json += "\"css\":\"" + cssTrangThai + "\",";
+                
+                json += "\"logs\":[";
+                for (int i = 0; i < logCount; i++) {
+                  // Giữ nguyên 2 chữ số thập phân cho lịch sử
+                  json += "{\"t\":" + String(historyList[i].truoc, 2) + ",\"l\":" + String(historyList[i].trai, 2) + ",\"r\":" + String(historyList[i].phai, 2) + ",\"h\":\"" + historyList[i].huongDi + "\"}";
+                  if (i < logCount - 1) json += ",";
+                }
+                json += "]";
+                json += "}";
+                client.print(json);
+              } 
+              else {
+                client.println("HTTP/1.1 200 OK");
+                client.println("Content-type:text/html; charset=utf-8");
+                client.println("Connection: close");
+                client.println();
+                
+                client.println("<!DOCTYPE html><html lang='vi'><head><meta charset='UTF-8'>");
+                client.println("<meta name='viewport' content='width=device-width, initial-scale=1.0'>");
+                client.println("<title>ESP32 Robot Dashboard</title>");
+                client.println("<style>");
+                client.println("* { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, sans-serif; }");
+                client.println("body { background: #090d16; color: #f8fafc; padding: 15px; }");
+                client.println(".container { max-width: 500px; margin: 0 auto; }");
+                client.println("h2 { text-align: center; color: #38bdf8; font-size: 20px; margin-bottom: 5px; }");
+                client.println(".sub { text-align: center; color: #64748b; font-size: 12px; margin-bottom: 15px; }");
+                
+                client.println(".action-banner { padding: 18px; border-radius: 14px; text-align: center; margin-bottom: 15px; box-shadow: 0 6px 20px rgba(0,0,0,0.5); border: 2px solid rgba(255,255,255,0.15); transition: 0.3s; }");
+                client.println(".action-label { font-size: 12px; font-weight: bold; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 5px; opacity: 0.9; }");
+                client.println(".action-text { font-size: 26px; font-weight: 900; text-shadow: 0 2px 4px rgba(0,0,0,0.3); }");
+                
+                client.println(".bg-tien { background: linear-gradient(135deg, #16a34a, #15803d); color: #dcfce7; }");
+                client.println(".bg-lui { background: linear-gradient(135deg, #ca8a04, #a16207); color: #fef9c3; }");
+                client.println(".bg-re { background: linear-gradient(135deg, #0284c7, #0369a1); color: #e0f2fe; }");
+                client.println(".bg-quay { background: linear-gradient(135deg, #dc2626, #b91c1c); color: #fee2e2; }");
+
+                client.println(".card { background: #1e293b; border: 1px solid #334155; border-radius: 14px; padding: 15px; margin-bottom: 15px; box-shadow: 0 8px 20px rgba(0,0,0,0.4); }");
+                client.println(".front-sensor { text-align: center; background: linear-gradient(135deg, #0284c7, #0369a1); border-radius: 10px; padding: 12px; margin-bottom: 12px; }");
+                client.println(".front-val { font-size: 42px; font-weight: bold; color: #fff; }");
+                client.println(".row { display: flex; gap: 10px; }");
+                client.println(".col { flex: 1; background: #0f172a; text-align: center; padding: 10px; border-radius: 10px; border: 1px solid #334155; }");
+                client.println(".val { font-size: 22px; font-weight: bold; color: #38bdf8; margin-top: 5px; }");
+                client.println(".unit { font-size: 11px; color: #94a3b8; }");
+
+                client.println(".control-title { font-size: 13px; color: #94a3b8; text-transform: uppercase; margin-bottom: 10px; font-weight: bold; text-align: center; }");
+                
+                client.println(".table-container { max-height: 350px; overflow-y: auto; border-radius: 8px; border: 1px solid #1e293b; background: #0f172a; }");
+                client.println(".table-container::-webkit-scrollbar { width: 6px; }");
+                client.println(".table-container::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }");
+                client.println("table { width: 100%; border-collapse: collapse; font-size: 12px; text-align: center; }");
+                client.println("th { position: sticky; top: 0; background: #1e293b; color: #38bdf8; font-size: 11px; padding: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.3); z-index: 1; }");
+                client.println("td { padding: 10px 5px; color: #e2e8f0; border-bottom: 1px solid #1e293b; }");
+                client.println(".badge-action { padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 11px; display: inline-block; white-space: nowrap; }");
+                
+                client.println("</style></head><body>");
+
+                client.println("<div class='container'>");
+                client.println("<h2>ĐIỀU KHIỂN & GIÁM SÁT XE</h2>");
+                client.println("<div class='sub' id='sub-status'>Trạng thái: Đang kết nối...</div>");
+
+                client.println("<div id='banner' class='action-banner bg-tien'>");
+                client.println("<div class='action-label'>HÀNH ĐỘNG SẮP TỚI CỦA XE</div>");
+                client.println("<div class='action-text' id='txt-hanhdong'>ĐANG KHỞI ĐỘNG</div>");
+                client.println("</div>");
+
+                client.println("<div class='card'>");
+                client.println("<div class='front-sensor'>");
+                client.println("<div style='font-size:12px; color:#e0f2fe; font-weight:bold;'>KHOẢNG CÁCH PHÍA TRƯỚC</div>");
+                client.println("<div class='front-val'><span id='val-truoc'>0.00</span> <span style='font-size:18px;'>cm</span></div>");
+                client.println("</div>");
+                
+                client.println("<div class='row'>");
+                client.println("<div class='col'><div class='unit'>BÊN TRÁI</div><div class='val'><span id='val-trai'>0.00</span> <span class='unit'>cm</span></div></div>");
+                client.println("<div class='col'><div class='unit'>NGƯỠNG DỪNG</div><div class='val' style='color:#f43f5e;'>30.00 <span class='unit'>cm</span></div></div>");
+                client.println("<div class='col'><div class='unit'>BÊN PHẢI</div><div class='val'><span id='val-phai'>0.00</span> <span class='unit'>cm</span></div></div>");
+                client.println("</div>");
+                client.println("</div>");
+
+                client.println("<div class='card'>");
+                client.println("<div class='control-title'>BẢNG LỊCH SỬ GIÁ TRỊ & XỬ LÝ</div>");
+                client.println("<div class='table-container'>");
+                client.println("<table id='log-table'>");
+                client.println("<tr><th>Trước</th><th>Trái</th><th>Phải</th><th>Hướng đi chọn</th></tr>");
+                client.println("</table>");
+                client.println("</div>"); 
+                client.println("</div>"); 
+
+                client.println("</div>"); 
+
+                client.println("<script>");
+                client.println("function fetchData() {");
+                client.println("  fetch('/data').then(function(res) { return res.json(); }).then(function(data) {");
+                // data.truoc lúc này là float (VD: 25.43), tự render vào HTML cực nét
+                client.println("    document.getElementById('val-truoc').innerText = data.truoc;");
+                client.println("    document.getElementById('val-trai').innerText = data.trai;");
+                client.println("    document.getElementById('val-phai').innerText = data.phai;");
+                client.println("    document.getElementById('sub-status').innerText = 'Trạng thái: ' + data.tt;");
+                client.println("    document.getElementById('txt-hanhdong').innerText = data.hd;");
+                client.println("    var banner = document.getElementById('banner');");
+                client.println("    banner.className = 'action-banner ' + data.css;");
+                
+                client.println("    var tableHtml = '<tr><th>Trước</th><th>Trái</th><th>Phải</th><th>Hướng đi chọn</th></tr>';");
+                client.println("    data.logs.forEach(function(item) {");
+                client.println("      var css = 'bg-tien';");
+                client.println("      if(item.h.indexOf('Lùi') >= 0) { css = 'bg-lui'; }");
+                client.println("      else if(item.h.indexOf('Quay đầu') >= 0) { css = 'bg-quay'; }");
+                client.println("      else if(item.h.indexOf('Rẽ') >= 0) { css = 'bg-re'; }");
+                
+                client.println("      var valTrai = (item.l == 0) ? '-' : item.l;");
+                client.println("      var valPhai = (item.r == 0) ? '-' : item.r;");
+                
+                client.println("      tableHtml += '<tr><td>' + item.t + '</td><td>' + valTrai + '</td><td>' + valPhai + '</td><td><span class=\"badge-action ' + css + '\">' + item.h + '</span></td></tr>';");
+                client.println("    });");
+                client.println("    document.getElementById('log-table').innerHTML = tableHtml;");
+                client.println("  }).catch(function(err) { console.log(err); });");
+                client.println("}");
+                client.println("setInterval(fetchData, 300);"); 
+                client.println("</script>");
+
+                client.println("</body></html>");
+              }
+              break;
+            } else {
+              currentLine = "";
+            }
+          } else if (c != '\r') {
+            currentLine += c;
+          }
+        }
+      }
+      client.stop();
+    }
+    vTaskDelay(10 / portTICK_PERIOD_MS); 
+  }
+}
+
+// ================= CHƯƠNG TRÌNH CHÍNH =================
+
+void loop() {
+  float truoc = doKhoangCach();
+  khoangCachTruoc = truoc;
+
+  static unsigned long lastLogTien = 0; 
+
+  if (truoc > KHOANG_DUNG) {
+    capNhatTrangThai("Đang tiến thẳng (Thoáng)", "ĐANG TIẾN THẲNG", "bg-tien", "TIEN");
+    chay(TOC_DO, TOC_DO);
+    
+    if (millis() - lastLogTien > 400) {
+      ghiLichSu(truoc, 0.00, 0.00, "Tiến thẳng");
+      lastLogTien = millis();
+    }
+    
+    delay(40);
+    return;
+  }
+
+  // ================= PHÁT HIỆN VẬT CẢN =================
+  chay(0, 0);
+  capNhatTrangThai("Phát hiện vật cản <= 30cm", "DỪNG & LÙI LẠI", "bg-lui", "LUI");
+  // Cập nhật lại in log Serial sang 2 chữ số thập phân
+  Serial.printf("\nVat can phia truoc: %.2f cm", truoc);
+  delay(500); 
+
+  chay(-TOC_DO, -TOC_DO);
+  capNhatTrangThai("Đang lùi tạo không gian", "ĐANG LÙI LẠI", "bg-lui", "LUI");
+  delay(300);
+
+  chay(0, 0);
+  delay(150);
+
+  capNhatTrangThai("Đang quét hai bên", "ĐANG QUÉT 2 BÊN", "bg-re", "TRAI"); 
+  
+  float phai = nhin(GOC_PHAI);
+  float trai = nhin(GOC_TRAI);
+  khoangCachPhai = phai;
+  khoangCachTrai = trai;
+
+  datGoc(GOC_THANG);
+  Serial.printf("\nQuet hai ben: Phai %.2f cm | Trai %.2f cm", phai, trai);
+
+  String huongChon = "";
+
+  if (phai < KHOANG_DUNG && trai < KHOANG_DUNG) {
+    if (phai >= trai) {
+      capNhatTrangThai("Ngõ cụt -> Quay đầu phải", "XE QUAY ĐẦU (PHẢI)", "bg-quay", "QUAY_DAU");
+      huongChon = "Quay đầu (Phải)";
+      rePhai(THOI_GIAN_QUAY_DAU);
+    } else {
+      capNhatTrangThai("Ngõ cụt -> Quay đầu trái", "XE QUAY ĐẦU (TRÁI)", "bg-quay", "QUAY_DAU");
+      huongChon = "Quay đầu (Trái)";
+      reTrai(THOI_GIAN_QUAY_DAU);
+    }
+  }
+  else if (phai >= trai) {
+    capNhatTrangThai("Bên phải rộng hơn -> Rẽ phải", "RẼ PHẢI", "bg-re", "PHAI");
+    huongChon = "Rẽ Phải";
+    rePhai(THOI_GIAN_RE);
+  }
+  else {
+    capNhatTrangThai("Bên trái rộng hơn -> Rẽ trái", "RẼ TRÁI", "bg-re", "TRAI");
+    huongChon = "Rẽ Trái";
+    reTrai(THOI_GIAN_RE);
+  }
+
+  ghiLichSu(truoc, trai, phai, huongChon);
+
+  chay(0, 0);
+  capNhatTrangThai("Ổn định, chuẩn bị chạy tiếp", "ĐANG TIẾN THẲNG", "bg-tien", "TIEN");
+  delay(400);
+}
