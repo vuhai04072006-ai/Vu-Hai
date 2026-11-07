@@ -1,0 +1,234 @@
+/*
+  PYWORLD.VN - Xe robot tự tránh vật cản
+  ESP32 + HC-SR04 + Servo + L298N
+*/
+
+#define TRIG_PIN 18
+#define ECHO_PIN 19
+#define SERVO_PIN 23
+
+#define ENA 27
+#define IN1 26
+#define IN2 25
+
+#define ENB 13
+#define IN3 33
+#define IN4 32
+
+const int KHOANG_DUNG = 30;
+
+const int TOC_DO = 40;
+const int TOC_DO_QUAY = 75;
+
+const int GOC_THANG = 90;
+const int GOC_PHAI = 20;
+const int GOC_TRAI = 160;
+
+// Thời gian quay, có thể điều chỉnh
+const int THOI_GIAN_RE = 550;
+const int THOI_GIAN_QUAY_DAU = 900;
+
+
+// ================= ĐIỀU KHIỂN ĐỘNG CƠ =================
+
+void banh(int chanEN, int chanA, int chanB, int v) {
+  v = constrain(v, -100, 100);
+
+  digitalWrite(chanA, v > 0 ? HIGH : LOW);
+  digitalWrite(chanB, v < 0 ? HIGH : LOW);
+
+  ledcWrite(chanEN, (uint32_t)abs(v) * 1023 / 100);
+}
+
+
+void chay(int trai, int phai) {
+  banh(ENA, IN1, IN2, trai);
+  banh(ENB, IN3, IN4, phai);
+}
+
+
+// ================= HÀM RẼ RIÊNG =================
+
+// Rẽ phải: bánh trái tiến, bánh phải lùi
+void rePhai(int thoiGian) {
+  chay(0, 0);
+  delay(100);
+
+  chay(TOC_DO_QUAY, -TOC_DO_QUAY);
+  delay(thoiGian);
+
+  chay(0, 0);
+  delay(150);
+}
+
+
+// Rẽ trái: bánh trái lùi, bánh phải tiến
+void reTrai(int thoiGian) {
+  chay(0, 0);
+  delay(100);
+
+  chay(-TOC_DO_QUAY, TOC_DO_QUAY);
+  delay(thoiGian);
+
+  chay(0, 0);
+  delay(150);
+}
+
+
+// ================= ĐIỀU KHIỂN SERVO =================
+
+void datGoc(int goc) {
+  uint32_t us = 500 + 1900UL * constrain(goc, 0, 180) / 180;
+
+  ledcWrite(
+    SERVO_PIN,
+    (uint32_t)((uint64_t)us * 65536 / 20000)
+  );
+}
+
+
+// ================= CẢM BIẾN SIÊU ÂM =================
+
+float doMotLan() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long t = pulseIn(ECHO_PIN, HIGH, 30000);
+
+  return (t == 0) ? 400 : t / 58.0;
+}
+
+
+float doKhoangCach() {
+  float a = doMotLan();
+  delay(15);
+
+  float b = doMotLan();
+  delay(15);
+
+  float c = doMotLan();
+
+  return max(min(a, b), min(max(a, b), c));
+}
+
+
+float nhin(int goc) {
+  datGoc(goc);
+  delay(300);
+
+  return doKhoangCach();
+}
+
+
+// ================= KHỞI ĐỘNG =================
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  int chan[] = {IN1, IN2, IN3, IN4};
+
+  for (int p : chan) {
+    pinMode(p, OUTPUT);
+  }
+
+  ledcAttach(ENA, 1000, 10);
+  ledcAttach(ENB, 1000, 10);
+  ledcAttach(SERVO_PIN, 50, 16);
+
+  datGoc(GOC_THANG);
+
+  chay(0, 0);
+
+  delay(2000);
+}
+
+
+// ================= CHƯƠNG TRÌNH CHÍNH =================
+
+void loop() {
+
+  // Đo khoảng cách phía trước
+  float truoc = doKhoangCach();
+
+  // Nếu đường phía trước thông thoáng thì tiếp tục chạy
+  if (truoc > KHOANG_DUNG) {
+    chay(TOC_DO, TOC_DO);
+    delay(40);
+    return;
+  }
+
+
+  // Phát hiện vật cản
+  chay(0, 0);
+
+  Serial.printf("\nVat can phia truoc: %.0f cm", truoc);
+
+  delay(200);
+
+
+  // Lùi lại để tạo khoảng trống trước khi rẽ
+  chay(-TOC_DO, -TOC_DO);
+  delay(300);
+
+  chay(0, 0);
+  delay(150);
+
+
+  // Quét phía bên phải và bên trái
+  float phai = nhin(GOC_PHAI);
+  float trai = nhin(GOC_TRAI);
+
+  datGoc(GOC_THANG);
+
+  Serial.printf(
+    "\nQuet hai ben: Phai %.0f cm | Trai %.0f cm",
+    phai, trai
+  );
+
+
+  // Nếu cả hai bên đều chật
+  if (phai < KHOANG_DUNG && trai < KHOANG_DUNG) {
+
+    Serial.println(" -> Ca hai ben deu chat");
+
+    // Chọn bên có khoảng cách lớn hơn để quay đầu
+    if (phai >= trai) {
+      Serial.println(" -> Quay dau sang phai");
+      rePhai(THOI_GIAN_QUAY_DAU);
+    }
+    else {
+      Serial.println(" -> Quay dau sang trai");
+      reTrai(THOI_GIAN_QUAY_DAU);
+    }
+
+  }
+
+  // Bên phải rộng hơn
+  else if (phai >= trai) {
+
+    Serial.println(" -> Re phai");
+    rePhai(THOI_GIAN_RE);
+
+  }
+
+  // Bên trái rộng hơn
+  else {
+
+    Serial.println(" -> Re trai");
+    reTrai(THOI_GIAN_RE);
+
+  }
+
+
+  // Dừng một chút rồi tiếp tục dò đường
+  chay(0, 0);
+  delay(200);
+}
